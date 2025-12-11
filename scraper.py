@@ -3,21 +3,35 @@ import shutil
 import time
 from typing import List, Dict
 
+import requests
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.utils import ChromeType
-from bs4 import BeautifulSoup
 
 
 NSE_BASE_URL = "https://www.nseindia.com"
 EVENT_CAL_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-event-calendar"
 BOARD_MEETINGS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-board-meetings"
 CORP_ACTIONS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-actions"
+CORP_FILING_API = NSE_BASE_URL + "/api/corporate-filing"
+CORP_ACTIONS_API = NSE_BASE_URL + "/api/corporate-actions"
+
+DEFAULT_HEADERS = {
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/129.0.0.0 Safari/537.36"
+    ),
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+}
 
 
 def _build_driver(headless: bool = True) -> webdriver.Chrome:
@@ -50,10 +64,116 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
     if chrome_bin:
         chrome_options.binary_location = chrome_bin
 
-    service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+    service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.set_page_load_timeout(30)
     return driver
+
+
+def _init_nse_session() -> requests.Session:
+    """
+    Prepare a requests session with headers and cookies primed by hitting the base URL.
+    """
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    # Prime cookies
+    resp = session.get(NSE_BASE_URL, timeout=8)
+    resp.raise_for_status()
+    return session
+
+
+def _pick(item: Dict, keys, default="") -> str:
+    for key in keys:
+        val = item.get(key)
+        if val is not None and val != "":
+            return str(val).strip()
+    return default
+
+
+def _fetch_corporate_actions_api(symbol: str) -> List[Dict]:
+    session = _init_nse_session()
+    resp = session.get(
+        CORP_ACTIONS_API,
+        params={"index": "equities", "symbol": symbol},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    items = payload.get("data") or payload.get("rows") or payload or []
+    rows: List[Dict] = []
+    for item in items:
+        rows.append(
+            {
+                "symbol": _pick(item, ["symbol", "SYMBOL"], symbol),
+                "company": _pick(item, ["company", "comp", "companyName"], ""),
+                "series": _pick(item, ["series"], ""),
+                "purpose": _pick(item, ["subject", "purpose"], ""),
+                "face_value": _pick(item, ["faceVal", "face_value"], ""),
+                "ex_date": _pick(item, ["exDate", "ex_date"], ""),
+                "record_date": _pick(item, ["recDate", "recordDate", "rec_date"], ""),
+                "book_closure_start": _pick(item, ["bcStartDate", "bc_start_date"], ""),
+                "book_closure_end": _pick(item, ["bcEndDate", "bc_end_date"], ""),
+            }
+        )
+    return rows
+
+
+def _fetch_board_meetings_api(symbol: str) -> List[Dict]:
+    session = _init_nse_session()
+    resp = session.get(
+        CORP_FILING_API,
+        params={"index": "equities", "symbol": symbol, "type": "Board Meeting"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    items = payload.get("data") or payload.get("rows") or payload or []
+    rows: List[Dict] = []
+    for item in items:
+        rows.append(
+            {
+                "symbol": _pick(item, ["symbol", "SYMBOL"], symbol),
+                "company": _pick(item, ["sm_name", "company", "companyName"], ""),
+                "purpose": _pick(item, ["bm_purpose", "purpose", "subject"], ""),
+                "details_link": _pick(item, ["detailsUrl", "details_link", "bm_details"], ""),
+                "meeting_date": _pick(item, ["bm_date", "meetingDate", "meeting_date"], ""),
+                "attachment_link": _pick(
+                    item, ["attachment", "attachmentUrl", "pdfUrl", "xmlUrl"], ""
+                ),
+                "broadcast_datetime": _pick(
+                    item, ["bm_timestamp", "broadcastDateTime", "broadcast_time"], ""
+                ),
+            }
+        )
+    return rows
+
+
+def _fetch_event_calendar_api(symbol: str) -> List[Dict]:
+    session = _init_nse_session()
+    resp = session.get(
+        CORP_FILING_API,
+        params={"index": "equities", "symbol": symbol, "type": "Event Calendar"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    items = payload.get("data") or payload.get("rows") or payload or []
+    rows: List[Dict] = []
+    for item in items:
+        rows.append(
+            {
+                "symbol": _pick(item, ["symbol", "SYMBOL"], symbol),
+                "company": _pick(item, ["company", "companyName", "sm_name"], ""),
+                "purpose": _pick(item, ["purpose", "subject", "event"], ""),
+                "details": _pick(
+                    item,
+                    ["details", "description", "bmdesc", "eventDescription"],
+                    "",
+                ),
+                "date": _pick(item, ["date", "eventDate", "bm_date"], ""),
+            }
+        )
+    return rows
 
 
 def _parse_event_calendar_table(html: str) -> List[Dict]:
@@ -228,29 +348,28 @@ def _parse_corporate_actions_table(html: str) -> List[Dict]:
 
 def get_event_calendar_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Open the NSE event calendar for the given symbol and return table JSON.
+    Fetch event calendar via NSE JSON API; fallback to Selenium if needed.
     """
     symbol = symbol.upper().strip()
-    driver = _build_driver(headless=headless)
 
+    # Fast path: API
     try:
-        # 1. Hit base to set cookies (NSE sometimes rejects direct deep links)
+        rows = _fetch_event_calendar_api(symbol)
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    # Fallback: Selenium (slower)
+    driver = _build_driver(headless=headless)
+    try:
         driver.get(NSE_BASE_URL)
         time.sleep(2)
-
-        # 2. Now open event calendar with query param symbol
         url = f"{EVENT_CAL_URL}?symbol={symbol}"
         driver.get(url)
 
         wait = WebDriverWait(driver, 25)
-
-        # The Equity tab's table gets populated via JS into div#CFeventCalendar
-        # Ultimately, the table we care about has id="CFeventCalendarTable"
-        wait.until(
-            EC.presence_of_element_located((By.ID, "CFeventCalendarTable"))
-        )
-
-        # Optional: small extra wait to let all rows render
+        wait.until(EC.presence_of_element_located((By.ID, "CFeventCalendarTable")))
         time.sleep(1.5)
 
         html = driver.page_source
@@ -261,11 +380,18 @@ def get_event_calendar_for_symbol(symbol: str, headless: bool = True) -> List[Di
 
 def get_board_meetings_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Open the NSE board meetings page for the given symbol and return table JSON.
+    Open the NSE board meetings for the given symbol using API, fallback to Selenium.
     """
     symbol = symbol.upper().strip()
-    driver = _build_driver(headless=headless)
 
+    try:
+        rows = _fetch_board_meetings_api(symbol)
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    driver = _build_driver(headless=headless)
     try:
         driver.get(NSE_BASE_URL)
         time.sleep(2)
@@ -285,11 +411,18 @@ def get_board_meetings_for_symbol(symbol: str, headless: bool = True) -> List[Di
 
 def get_corporate_actions_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Open the NSE corporate actions page for the given symbol and return table JSON.
+    Open the NSE corporate actions for the given symbol via API, fallback to Selenium.
     """
     symbol = symbol.upper().strip()
-    driver = _build_driver(headless=headless)
 
+    try:
+        rows = _fetch_corporate_actions_api(symbol)
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    driver = _build_driver(headless=headless)
     try:
         driver.get(NSE_BASE_URL)
         time.sleep(2)
