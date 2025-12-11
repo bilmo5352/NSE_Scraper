@@ -1,7 +1,6 @@
 import os
 import shutil
 import time
-import threading
 from typing import List, Dict
 
 import requests
@@ -12,7 +11,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
 
 
@@ -20,7 +18,6 @@ NSE_BASE_URL = "https://www.nseindia.com"
 EVENT_CAL_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-event-calendar"
 BOARD_MEETINGS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-board-meetings"
 CORP_ACTIONS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-actions"
-ANNOUNCEMENTS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-announcements"
 CORP_FILING_API = NSE_BASE_URL + "/api/corporate-filing"
 CORP_ACTIONS_API = NSE_BASE_URL + "/api/corporate-actions"
 USE_SELENIUM_FALLBACK = os.environ.get("USE_SELENIUM_FALLBACK", "true").lower() == "true"
@@ -80,54 +77,6 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
     driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.set_page_load_timeout(30)
     return driver
-
-
-# Global driver management for resource-constrained environments
-_driver_lock = threading.Lock()
-_driver = None
-
-
-def _create_driver():
-    """Create a new driver instance (wrapper for _build_driver)."""
-    return _build_driver(headless=True)
-
-
-def get_shared_driver():
-    """
-    Return a shared Selenium driver protected by a lock.
-    Use with `with` statement to ensure exclusive access.
-    
-    Example:
-        with get_shared_driver() as driver:
-            driver.get(url)
-            html = driver.page_source
-    """
-    class DriverContext:
-        def __enter__(self_inner):
-            global _driver
-            _driver_lock.acquire()
-            if _driver is None:
-                _driver = _create_driver()
-            self_inner.driver = _driver
-            return self_inner.driver
-
-        def __exit__(self_inner, exc_type, exc, tb):
-            _driver_lock.release()
-    return DriverContext()
-
-
-def reset_driver():
-    """
-    Kill and recreate the shared driver (used after crashes).
-    """
-    global _driver
-    with _driver_lock:
-        if _driver is not None:
-            try:
-                _driver.quit()
-            except Exception:
-                pass
-            _driver = None
 
 
 def _init_nse_session() -> requests.Session:
@@ -413,87 +362,6 @@ def _parse_corporate_actions_table(html: str) -> List[Dict]:
     return rows
 
 
-def _parse_announcements_table(html: str) -> List[Dict]:
-    """
-    Parse the announcements equity table (id="CFanncEquityTable") and return a list of dicts.
-    Columns: SYMBOL, COMPANY NAME, SUBJECT, DETAILS, ATTACHMENT, XBRL, BROADCAST DATE/TIME
-    """
-    soup = BeautifulSoup(html, "lxml")
-    
-    # Try multiple table ID variations
-    table = soup.find("table", id="CFanncEquityTable")
-    if not table:
-        # Try alternative IDs
-        table = soup.find("table", id="CFanncEquity")
-        if not table:
-            table = soup.find("table", class_=lambda x: x and "annc" in x.lower())
-    
-    if not table:
-        return []
-
-    rows: List[Dict] = []
-    tbody = table.find("tbody")
-    if not tbody:
-        return rows
-
-    for tr in tbody.find_all("tr"):
-        tds = tr.find_all("td")
-        # Skip rows with insufficient columns (headers, empty rows, etc.)
-        if len(tds) < 7:
-            continue
-
-        # 0: symbol
-        symbol_cell = tds[0]
-        symbol_link = symbol_cell.find("a")
-        symbol = (symbol_link.get_text(strip=True) if symbol_link else symbol_cell.get_text(strip=True))
-
-        # 1: company name
-        company = tds[1].get_text(strip=True)
-
-        # 2: subject
-        subject = tds[2].get_text(strip=True)
-
-        # 3: details
-        details_cell = tds[3]
-        # Try to get full text from data attributes or content
-        full_desc_attr = details_cell.get("data-ws-symbol-col-prev") or details_cell.get("data-ws-symbol-col")
-        if full_desc_attr:
-            details = full_desc_attr.strip()
-        else:
-            content_span = details_cell.find("span", class_="content")
-            if content_span:
-                details = content_span.get_text(strip=True)
-            else:
-                details = details_cell.get_text(strip=True)
-
-        # 4: attachment link (optional)
-        attachment_cell = tds[4]
-        attachment_anchor = attachment_cell.find("a")
-        attachment_link = attachment_anchor["href"] if attachment_anchor and attachment_anchor.has_attr("href") else ""
-
-        # 5: XBRL link (optional)
-        xbrl_cell = tds[5]
-        xbrl_anchor = xbrl_cell.find("a")
-        xbrl_link = xbrl_anchor["href"] if xbrl_anchor and xbrl_anchor.has_attr("href") else ""
-
-        # 6: broadcast date/time
-        broadcast_datetime = tds[6].get_text(strip=True)
-
-        rows.append(
-            {
-                "symbol": symbol,
-                "company": company,
-                "subject": subject,
-                "details": details,
-                "attachment_link": attachment_link,
-                "xbrl_link": xbrl_link,
-                "broadcast_datetime": broadcast_datetime,
-            }
-        )
-    
-    return rows
-
-
 def get_event_calendar_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
     Fetch event calendar via NSE JSON API; fallback to Selenium if needed.
@@ -511,21 +379,19 @@ def get_event_calendar_for_symbol(symbol: str, headless: bool = True) -> List[Di
     if not USE_SELENIUM_FALLBACK:
         raise RuntimeError("API fetch failed and Selenium fallback disabled")
 
+    driver = _build_driver(headless=headless)
     try:
-        with get_shared_driver() as driver:
-            driver.get(NSE_BASE_URL)
-            url = f"{EVENT_CAL_URL}?symbol={symbol}"
-            driver.get(url)
+        driver.get(NSE_BASE_URL)
+        url = f"{EVENT_CAL_URL}?symbol={symbol}"
+        driver.get(url)
 
-            wait = WebDriverWait(driver, 15)
-            wait.until(EC.presence_of_element_located((By.ID, "CFeventCalendarTable")))
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFeventCalendarTable")))
 
-            html = driver.page_source
-            return _parse_event_calendar_table(html)
-    except WebDriverException as e:
-        # If Chrome crashed, reset the shared driver so next request gets a fresh one
-        reset_driver()
-        raise RuntimeError(f"Chrome driver error: {str(e)}")
+        html = driver.page_source
+        return _parse_event_calendar_table(html)
+    finally:
+        driver.quit()
 
 
 def get_board_meetings_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
@@ -544,22 +410,20 @@ def get_board_meetings_for_symbol(symbol: str, headless: bool = True) -> List[Di
     if not USE_SELENIUM_FALLBACK:
         raise RuntimeError("API fetch failed and Selenium fallback disabled")
 
+    driver = _build_driver(headless=headless)
     try:
-        with get_shared_driver() as driver:
-            driver.get(NSE_BASE_URL)
+        driver.get(NSE_BASE_URL)
 
-            url = f"{BOARD_MEETINGS_URL}?symbol={symbol}"
-            driver.get(url)
+        url = f"{BOARD_MEETINGS_URL}?symbol={symbol}"
+        driver.get(url)
 
-            wait = WebDriverWait(driver, 15)
-            wait.until(EC.presence_of_element_located((By.ID, "CFboardmeetingEquityTable")))
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFboardmeetingEquityTable")))
 
-            html = driver.page_source
-            return _parse_board_meetings_table(html)
-    except WebDriverException as e:
-        # If Chrome crashed, reset the shared driver so next request gets a fresh one
-        reset_driver()
-        raise RuntimeError(f"Chrome driver error: {str(e)}")
+        html = driver.page_source
+        return _parse_board_meetings_table(html)
+    finally:
+        driver.quit()
 
 
 def get_corporate_actions_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
@@ -578,132 +442,17 @@ def get_corporate_actions_for_symbol(symbol: str, headless: bool = True) -> List
     if not USE_SELENIUM_FALLBACK:
         raise RuntimeError("API fetch failed and Selenium fallback disabled")
 
+    driver = _build_driver(headless=headless)
     try:
-        with get_shared_driver() as driver:
-            driver.get(NSE_BASE_URL)
+        driver.get(NSE_BASE_URL)
 
-            url = f"{CORP_ACTIONS_URL}?symbol={symbol}"
-            driver.get(url)
+        url = f"{CORP_ACTIONS_URL}?symbol={symbol}"
+        driver.get(url)
 
-            wait = WebDriverWait(driver, 15)
-            wait.until(EC.presence_of_element_located((By.ID, "CFcorpactionsEquityTable")))
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFcorpactionsEquityTable")))
 
-            html = driver.page_source
-            return _parse_corporate_actions_table(html)
-    except WebDriverException as e:
-        # If Chrome crashed, reset the shared driver so next request gets a fresh one
-        reset_driver()
-        raise RuntimeError(f"Chrome driver error: {str(e)}")
-
-
-def _fetch_announcements_api(symbol: str) -> List[Dict]:
-    """
-    Try to fetch announcements via API endpoint (if available).
-    """
-    session = _init_nse_session()
-    try:
-        resp = session.get(
-            CORP_FILING_API,
-            params={"index": "equities", "symbol": symbol, "type": "Announcement"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        items = payload.get("data") or payload.get("rows") or payload or []
-        rows: List[Dict] = []
-        for item in items:
-            rows.append(
-                {
-                    "symbol": _pick(item, ["symbol", "SYMBOL"], symbol),
-                    "company": _pick(item, ["sm_name", "company", "companyName"], ""),
-                    "subject": _pick(item, ["desc", "subject", "purpose"], ""),
-                    "details": _pick(item, ["details", "description", "attchmntText"], ""),
-                    "attachment_link": _pick(item, ["attachment", "attachmentUrl", "attchmntFile"], ""),
-                    "xbrl_link": _pick(item, ["xbrl", "xbrlUrl", "seq_id"], ""),
-                    "broadcast_datetime": _pick(item, ["an_dt", "broadcastDateTime", "broadcast_datetime"], ""),
-                }
-            )
-        return rows
-    except Exception:
-        # API endpoint might not exist or might use different params
-        return []
-
-
-def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
-    """
-    Fetch announcements for the given symbol via API (if available), fallback to Selenium scraping.
-    """
-    symbol = symbol.upper().strip()
-
-    # Try API first - but always fall back to Selenium if empty or fails
-    try:
-        rows = _fetch_announcements_api(symbol)
-        # Only use API results if we got actual data
-        if rows and len(rows) > 0:
-            return rows
-    except Exception:
-        # API failed, continue to Selenium
-        pass
-
-    if not USE_SELENIUM_FALLBACK:
-        raise RuntimeError("API fetch failed and Selenium fallback disabled")
-
-    try:
-        with get_shared_driver() as driver:
-            print(f"[DEBUG] Loading NSE base URL...")
-            driver.get(NSE_BASE_URL)
-            time.sleep(2)  # Wait for cookies/session
-
-            url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
-            print(f"[DEBUG] Loading announcements URL: {url}")
-            driver.get(url)
-            
-            # Wait longer for table to load - try multiple strategies
-            wait = WebDriverWait(driver, 25)
-            table_found = False
-            
-            # Strategy 1: Wait for table by ID
-            try:
-                wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
-                # Also wait for it to be visible and have rows
-                wait.until(EC.visibility_of_element_located((By.ID, "CFanncEquityTable")))
-                time.sleep(2)  # Additional wait for dynamic content
-                table_found = True
-                print(f"[DEBUG] Table CFanncEquityTable found and visible")
-            except Exception as e:
-                print(f"[DEBUG] Table not found with ID CFanncEquityTable: {str(e)}")
-            
-            # Strategy 2: Try alternative selectors
-            if not table_found:
-                try:
-                    # Wait for any table with 'annc' in ID
-                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table[id*='annc']")))
-                    time.sleep(2)
-                    table_found = True
-                    print(f"[DEBUG] Found table with alternative selector")
-                except:
-                    pass
-            
-            # Strategy 3: Wait for tbody with rows
-            if not table_found:
-                try:
-                    wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "table#CFanncEquityTable tbody tr")) > 0)
-                    time.sleep(2)
-                    table_found = True
-                    print(f"[DEBUG] Found table rows")
-                except:
-                    pass
-            
-            # Final wait for any dynamic loading
-            if table_found:
-                time.sleep(3)
-            else:
-                time.sleep(5)
-
-            html = driver.page_source
-            rows = _parse_announcements_table(html)
-            return rows
-    except WebDriverException as e:
-        # If Chrome crashed, reset the shared driver so next request gets a fresh one
-        reset_driver()
-        raise RuntimeError(f"Chrome driver error: {str(e)}")
+        html = driver.page_source
+        return _parse_corporate_actions_table(html)
+    finally:
+        driver.quit()

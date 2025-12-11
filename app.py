@@ -5,7 +5,6 @@ from scraper import (
     get_event_calendar_for_symbol,
     get_board_meetings_for_symbol,
     get_corporate_actions_for_symbol,
-    get_announcements_for_symbol,
 )
 
 
@@ -141,55 +140,6 @@ def create_app():
 
         try:
             rows = get_corporate_actions_for_symbol(symbol, headless=True)
-        except Exception as e:
-            return (
-                jsonify(
-                    {
-                        "symbol": symbol.upper(),
-                        "error": "scrape_failed",
-                        "message": str(e),
-                    }
-                ),
-                500,
-            )
-
-        return jsonify(
-            {
-                "symbol": symbol.upper(),
-                "count": len(rows),
-                "rows": rows,
-            }
-        )
-
-    @app.route("/announcements", methods=["GET"])
-    def announcements():
-        """
-        GET /announcements?symbol=RELIANCE
-
-        Response:
-        {
-          "symbol": "RELIANCE",
-          "count": 20,
-          "rows": [
-            {
-              "symbol": "RELIANCE",
-              "company": "Reliance Industries Limited",
-              "subject": "Copy of Newspaper Publication",
-              "details": "...",
-              "attachment_link": "https://...",
-              "xbrl_link": "https://...",
-              "broadcast_datetime": "10-Oct-2025 11:55:48",
-            },
-            ...
-          ]
-        }
-        """
-        symbol = request.args.get("symbol", "").strip()
-        if not symbol:
-            raise BadRequest("Query parameter 'symbol' is required")
-
-        try:
-            rows = get_announcements_for_symbol(symbol, headless=True)
         except Exception as e:
             return (
                 jsonify(
