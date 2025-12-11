@@ -18,6 +18,7 @@ NSE_BASE_URL = "https://www.nseindia.com"
 EVENT_CAL_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-event-calendar"
 BOARD_MEETINGS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-board-meetings"
 CORP_ACTIONS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-actions"
+ANNOUNCEMENTS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-announcements"
 CORP_FILING_API = NSE_BASE_URL + "/api/corporate-filing"
 CORP_ACTIONS_API = NSE_BASE_URL + "/api/corporate-actions"
 USE_SELENIUM_FALLBACK = os.environ.get("USE_SELENIUM_FALLBACK", "true").lower() == "true"
@@ -187,6 +188,33 @@ def _fetch_event_calendar_api(symbol: str) -> List[Dict]:
                     "",
                 ),
                 "date": _pick(item, ["date", "eventDate", "bm_date"], ""),
+            }
+        )
+    return rows
+
+
+def _fetch_announcements_api(symbol: str) -> List[Dict]:
+    session = _init_nse_session()
+    resp = session.get(
+        CORP_FILING_API,
+        params={"index": "equities", "symbol": symbol, "type": "Announcement"},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    items = payload.get("data") or payload.get("rows") or payload or []
+    rows: List[Dict] = []
+    for item in items:
+        rows.append(
+            {
+                "symbol": _pick(item, ["symbol", "SYMBOL"], symbol),
+                "company": _pick(item, ["sm_name", "company", "companyName"], ""),
+                "subject": _pick(item, ["desc", "subject", "purpose"], ""),
+                "details": _pick(item, ["attchmntText", "details", "description"], ""),
+                "attachment_link": _pick(item, ["attachment", "attachmentUrl", "pdfUrl"], ""),
+                "attachment_size": _pick(item, ["attachmentSize", "size"], ""),
+                "xbrl_link": _pick(item, ["xbrlUrl", "xbrl_link", "xmlUrl"], ""),
+                "broadcast_datetime": _pick(item, ["an_dt", "broadcastDateTime", "broadcast_time"], ""),
             }
         )
     return rows
@@ -454,5 +482,124 @@ def get_corporate_actions_for_symbol(symbol: str, headless: bool = True) -> List
 
         html = driver.page_source
         return _parse_corporate_actions_table(html)
+    finally:
+        driver.quit()
+
+
+def _parse_announcements_table(html: str) -> List[Dict]:
+    """
+    Parse the announcements equity table and return a list of dicts.
+    Table ID: CFanncEquityTable
+    Columns: SYMBOL, COMPANY NAME, SUBJECT, DETAILS, ATTACHMENT, XBRL, BROADCAST DATE/TIME
+    """
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.find("table", id="CFanncEquityTable")
+    if not table:
+        return []
+
+    rows: List[Dict] = []
+    tbody = table.find("tbody")
+    if not tbody:
+        return rows
+
+    for tr in tbody.find_all("tr"):
+        tds = tr.find_all("td")
+        if len(tds) < 7:
+            continue
+
+        # 0: symbol
+        symbol_cell = tds[0]
+        symbol_link = symbol_cell.find("a")
+        symbol = (symbol_link.get_text(strip=True) if symbol_link else symbol_cell.get_text(strip=True))
+
+        # 1: company name
+        company = tds[1].get_text(strip=True)
+
+        # 2: subject
+        subject = tds[2].get_text(strip=True)
+
+        # 3: details
+        details_cell = tds[3]
+        # Try to get full text from data attribute first
+        full_desc_attr = details_cell.get("data-ws-symbol-col-prev") or details_cell.get("data-ws-symbol-col")
+        if full_desc_attr:
+            details = full_desc_attr.strip()
+        else:
+            # Try content span (truncated text)
+            content_span = details_cell.find("span", class_="content")
+            if content_span:
+                details = content_span.get_text(strip=True)
+            else:
+                details = details_cell.get_text(strip=True)
+
+        # 4: attachment (PDF link and size)
+        attachment_cell = tds[4]
+        attachment_anchor = attachment_cell.find("a")
+        attachment_link = ""
+        attachment_size = ""
+        if attachment_anchor and attachment_anchor.has_attr("href"):
+            attachment_link = attachment_anchor["href"]
+            # Get size from the <p> tag that follows
+            size_p = attachment_cell.find("p", class_="mt-1")
+            if size_p:
+                attachment_size = size_p.get_text(strip=True)
+
+        # 5: XBRL link
+        xbrl_cell = tds[5]
+        xbrl_anchor = xbrl_cell.find("a")
+        xbrl_link = ""
+        if xbrl_anchor and xbrl_anchor.has_attr("href"):
+            xbrl_link = xbrl_anchor["href"]
+            # Make it absolute if relative
+            if xbrl_link.startswith("/"):
+                xbrl_link = NSE_BASE_URL + xbrl_link
+
+        # 6: broadcast date/time
+        broadcast_datetime = tds[6].get_text(strip=True)
+
+        rows.append(
+            {
+                "symbol": symbol,
+                "company": company,
+                "subject": subject,
+                "details": details,
+                "attachment_link": attachment_link,
+                "attachment_size": attachment_size,
+                "xbrl_link": xbrl_link,
+                "broadcast_datetime": broadcast_datetime,
+            }
+        )
+    return rows
+
+
+def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
+    """
+    Fetch announcements for the given symbol via API, fallback to Selenium.
+    """
+    symbol = symbol.upper().strip()
+
+    # Fast path: API
+    try:
+        rows = _fetch_announcements_api(symbol)
+        if rows:
+            return rows
+    except Exception:
+        pass
+
+    if not USE_SELENIUM_FALLBACK:
+        raise RuntimeError("API fetch failed and Selenium fallback disabled")
+
+    driver = _build_driver(headless=headless)
+    try:
+        driver.get(NSE_BASE_URL)
+
+        url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
+        driver.get(url)
+
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
+
+        html = driver.page_source
+        return _parse_announcements_table(html)
     finally:
         driver.quit()
