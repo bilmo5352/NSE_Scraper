@@ -43,41 +43,91 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-setuid-sandbox")
+    chrome_options.add_argument("--window-size=1280,720")
+    chrome_options.add_argument("--memory-pressure-off")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-background-timer-throttling")
+    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_options.add_argument("--disable-breakpad")
+    chrome_options.add_argument("--disable-client-side-phishing-detection")
+    chrome_options.add_argument("--disable-default-apps")
+    chrome_options.add_argument("--disable-features=TranslateUI")
+    chrome_options.add_argument("--disable-hang-monitor")
+    chrome_options.add_argument("--disable-ipc-flooding-protection")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--disable-prompt-on-repost")
+    chrome_options.add_argument("--disable-renderer-backgrounding")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--disable-translate")
+    chrome_options.add_argument("--metrics-recording-only")
+    chrome_options.add_argument("--no-first-run")
+    chrome_options.add_argument("--safebrowsing-disable-auto-update")
+    chrome_options.add_argument("--enable-automation")
+    chrome_options.add_argument("--password-store=basic")
+    chrome_options.add_argument("--use-mock-keychain")
     chrome_options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/129.0.0.0 Safari/537.36"
     )
 
-    # Explicitly set Chromium binary if provided (Render needs this)
+    # Explicitly set Chromium binary if provided (Render/Railway needs this)
     chrome_bin = os.environ.get("CHROME_BIN")
     if not chrome_bin:
         for candidate in (
             "/usr/bin/chromium",
             "/usr/bin/chromium-browser",
             "/usr/bin/google-chrome",
+            "/usr/bin/chromium/chromium",
         ):
             if os.path.exists(candidate):
                 chrome_bin = candidate
                 break
         if not chrome_bin:
             chrome_bin = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    
     if chrome_bin:
+        if not os.path.exists(chrome_bin):
+            raise RuntimeError(f"Chrome binary not found at {chrome_bin}")
         chrome_options.binary_location = chrome_bin
+    else:
+        # Try to find it anyway
+        found = shutil.which("chromium") or shutil.which("chromium-browser")
+        if found:
+            chrome_options.binary_location = found
 
     # Prefer preinstalled chromedriver if available
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
     if chromedriver_path:
+        if not os.path.exists(chromedriver_path):
+            raise RuntimeError(f"ChromeDriver not found at {chromedriver_path}")
         service = Service(chromedriver_path)
     else:
-        service = Service(ChromeDriverManager().install())
+        # Try to find chromedriver in common locations
+        for candidate in ("/usr/bin/chromedriver", "/usr/local/bin/chromedriver"):
+            if os.path.exists(candidate):
+                chromedriver_path = candidate
+                service = Service(chromedriver_path)
+                break
+        else:
+            # Last resort: use ChromeDriverManager
+            service = Service(ChromeDriverManager().install())
 
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    driver.set_page_load_timeout(30)
-    return driver
+    try:
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(30)
+        return driver
+    except Exception as e:
+        error_msg = f"Failed to start Chrome: {str(e)}"
+        if chrome_bin:
+            error_msg += f" (Chrome binary: {chrome_bin})"
+        if chromedriver_path:
+            error_msg += f" (ChromeDriver: {chromedriver_path})"
+        raise RuntimeError(error_msg) from e
 
 
 def _init_nse_session() -> requests.Session:
@@ -602,4 +652,5 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         html = driver.page_source
         return _parse_announcements_table(html)
     finally:
+        driver.quit()
         driver.quit()
