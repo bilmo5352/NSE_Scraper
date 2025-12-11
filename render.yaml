@@ -12,7 +12,7 @@ services:
     apt-get install -y chromium
   startCommand: |
     PORT=${PORT:-8000}
-    python app.py
+    gunicorn "app:app" --bind 0.0.0.0:${PORT} --workers 2 --threads 4 --timeout 120
   envVars:
     - key: PYTHON_VERSION
       value: 3.11

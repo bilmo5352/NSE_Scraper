@@ -163,7 +163,10 @@ def create_app():
     return app
 
 
+# WSGI entrypoint for process managers (gunicorn, etc.)
+app = create_app()
+
+
 if __name__ == "__main__":
-    app = create_app()
     # For dev: threaded True so multiple requests can run in parallel
     app.run(host="0.0.0.0", port=8000, debug=True, threaded=True)
