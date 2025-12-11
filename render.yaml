@@ -9,7 +9,7 @@ services:
     pip install -r requirements.txt
     # Install Chromium for Selenium; Render base image is Debian/Ubuntu
     apt-get update
-    apt-get install -y chromium
+    apt-get install -y chromium chromium-driver
   startCommand: |
     PORT=${PORT:-8000}
     gunicorn "app:app" --bind 0.0.0.0:${PORT} --workers 2 --threads 4 --timeout 120

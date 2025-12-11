@@ -1,3 +1,5 @@
+import os
+import shutil
 import time
 from typing import List, Dict
 
@@ -8,6 +10,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.utils import ChromeType
 from bs4 import BeautifulSoup
 
 
@@ -33,7 +36,21 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
         "Chrome/129.0.0.0 Safari/537.36"
     )
 
-    service = Service(ChromeDriverManager().install())
+    # Explicitly set Chromium binary if provided (Render needs this)
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if not chrome_bin:
+        # fallbacks common across distros
+        for candidate in ("/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"):
+            if os.path.exists(candidate):
+                chrome_bin = candidate
+                break
+        if not chrome_bin:
+            # last resort: search PATH
+            chrome_bin = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    if chrome_bin:
+        chrome_options.binary_location = chrome_bin
+
+    service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     driver.set_page_load_timeout(30)
     return driver
