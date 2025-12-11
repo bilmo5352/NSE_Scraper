@@ -1,7 +1,17 @@
+import os
+import shutil
+import time
 from typing import List, Dict
 
 import requests
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 NSE_BASE_URL = "https://www.nseindia.com"
@@ -11,61 +21,81 @@ CORP_ACTIONS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-actions"
 ANNOUNCEMENTS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-announcements"
 CORP_FILING_API = NSE_BASE_URL + "/api/corporate-filing"
 CORP_ACTIONS_API = NSE_BASE_URL + "/api/corporate-actions"
+USE_SELENIUM_FALLBACK = os.environ.get("USE_SELENIUM_FALLBACK", "true").lower() == "true"
 
 DEFAULT_HEADERS = {
-    "User-Agent": (
+    "user-agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/129.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
+    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "accept-language": "en-US,en;q=0.9",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
 }
+
+
+def _build_driver(headless: bool = True) -> webdriver.Chrome:
+    chrome_options = Options()
+    if headless:
+        chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/129.0.0.0 Safari/537.36"
+    )
+
+    # Explicitly set Chromium binary if provided (Render needs this)
+    chrome_bin = os.environ.get("CHROME_BIN")
+    if not chrome_bin:
+        for candidate in (
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome",
+        ):
+            if os.path.exists(candidate):
+                chrome_bin = candidate
+                break
+        if not chrome_bin:
+            chrome_bin = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    if chrome_bin:
+        chrome_options.binary_location = chrome_bin
+
+    # Prefer preinstalled chromedriver if available
+    chromedriver_path = os.environ.get("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+    if chromedriver_path:
+        service = Service(chromedriver_path)
+    else:
+        service = Service(ChromeDriverManager().install())
+
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.set_page_load_timeout(30)
+    return driver
 
 
 def _init_nse_session() -> requests.Session:
     """
     Prepare a requests session with headers and cookies primed by hitting the base URL.
-    NSE requires proper session cookies and headers to avoid 403 errors.
     """
-    import time
-    
     session = requests.Session()
-    
-    # Set comprehensive headers to mimic a real browser
     session.headers.update(DEFAULT_HEADERS)
-    
-    # First, visit the base URL to establish session and get cookies
-    # This is critical - NSE sets session cookies on the first visit
-    try:
-        # Initial visit with minimal headers
-        resp = session.get(NSE_BASE_URL, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        
-        # Wait a bit to simulate human behavior and let cookies settle
-        time.sleep(1.5)
-        
-        # Optionally visit a common page to further establish session
-        # This helps with some NSE endpoints that check navigation history
-        try:
-            session.get(f"{NSE_BASE_URL}/market-data", timeout=10, allow_redirects=True)
-            time.sleep(0.5)
-        except:
-            pass
-            
-    except requests.RequestException as e:
-        # If base URL fails, still return session (some endpoints might work)
-        # But log that session initialization had issues
-        pass
-    
+    session.headers.update(
+        {
+            "referer": NSE_BASE_URL,
+            "accept": "application/json,text/html;q=0.9",
+            "accept-encoding": "gzip, deflate, br",
+        }
+    )
+    # Prime cookies
+    resp = session.get(NSE_BASE_URL, timeout=5)
+    resp.raise_for_status()
     return session
 
 
@@ -414,69 +444,9 @@ def _parse_announcements_table(html: str) -> List[Dict]:
     return rows
 
 
-def _fetch_html(session: requests.Session, url: str, params: dict = None) -> str:
-    """
-    Fetch HTML content from NSE URL with proper session handling.
-    Updates headers for the specific request to avoid 403 errors.
-    """
-    import time
-    
-    # Update headers for this specific request (mimic browser navigation)
-    session.headers.update({
-        "Referer": NSE_BASE_URL,
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-    })
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Add small delay to avoid rate limiting
-            if attempt > 0:
-                time.sleep(2)  # Longer delay on retry
-            
-            resp = session.get(url, params=params, timeout=20, allow_redirects=True)
-            
-            # Check for 403 or other errors
-            if resp.status_code == 403:
-                if attempt < max_retries - 1:
-                    # Refresh session by visiting base URL again
-                    try:
-                        session.get(NSE_BASE_URL, timeout=10, allow_redirects=True)
-                        time.sleep(1)
-                    except:
-                        pass
-                    continue
-                else:
-                    raise RuntimeError(f"403 Forbidden: NSE is blocking requests. This may require browser automation.")
-            
-            resp.raise_for_status()
-            return resp.text
-            
-        except requests.HTTPError as e:
-            if hasattr(e, 'response') and e.response.status_code == 403 and attempt < max_retries - 1:
-                # Try refreshing session
-                try:
-                    session.get(NSE_BASE_URL, timeout=10, allow_redirects=True)
-                    time.sleep(1)
-                except:
-                    pass
-                continue
-            status_code = getattr(e.response, 'status_code', 'N/A') if hasattr(e, 'response') else 'N/A'
-            raise RuntimeError(f"HTTP {status_code} error fetching {url}: {e}")
-        except requests.RequestException as e:
-            if attempt < max_retries - 1:
-                continue
-            raise RuntimeError(f"Failed to fetch {url}: {e}")
-    
-    raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts")
-
-
 def get_event_calendar_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Fetch event calendar via NSE JSON API; fallback to HTML scraping if needed.
+    Fetch event calendar via NSE JSON API; fallback to Selenium if needed.
     """
     symbol = symbol.upper().strip()
 
@@ -488,18 +458,27 @@ def get_event_calendar_for_symbol(symbol: str, headless: bool = True) -> List[Di
     except Exception:
         pass
 
-    # Fallback: HTML scraping with requests
-    session = _init_nse_session()
+    if not USE_SELENIUM_FALLBACK:
+        raise RuntimeError("API fetch failed and Selenium fallback disabled")
+
+    driver = _build_driver(headless=headless)
     try:
-        html = _fetch_html(session, EVENT_CAL_URL, params={"symbol": symbol})
+        driver.get(NSE_BASE_URL)
+        url = f"{EVENT_CAL_URL}?symbol={symbol}"
+        driver.get(url)
+
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFeventCalendarTable")))
+
+        html = driver.page_source
         return _parse_event_calendar_table(html)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch event calendar for {symbol}: {e}")
+    finally:
+        driver.quit()
 
 
 def get_board_meetings_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Fetch board meetings for the given symbol using API, fallback to HTML scraping.
+    Open the NSE board meetings for the given symbol using API, fallback to Selenium.
     """
     symbol = symbol.upper().strip()
 
@@ -510,18 +489,28 @@ def get_board_meetings_for_symbol(symbol: str, headless: bool = True) -> List[Di
     except Exception:
         pass
 
-    # Fallback: HTML scraping with requests
-    session = _init_nse_session()
+    if not USE_SELENIUM_FALLBACK:
+        raise RuntimeError("API fetch failed and Selenium fallback disabled")
+
+    driver = _build_driver(headless=headless)
     try:
-        html = _fetch_html(session, BOARD_MEETINGS_URL, params={"symbol": symbol})
+        driver.get(NSE_BASE_URL)
+
+        url = f"{BOARD_MEETINGS_URL}?symbol={symbol}"
+        driver.get(url)
+
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFboardmeetingEquityTable")))
+
+        html = driver.page_source
         return _parse_board_meetings_table(html)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch board meetings for {symbol}: {e}")
+    finally:
+        driver.quit()
 
 
 def get_corporate_actions_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Fetch corporate actions for the given symbol via API, fallback to HTML scraping.
+    Open the NSE corporate actions for the given symbol via API, fallback to Selenium.
     """
     symbol = symbol.upper().strip()
 
@@ -532,13 +521,23 @@ def get_corporate_actions_for_symbol(symbol: str, headless: bool = True) -> List
     except Exception:
         pass
 
-    # Fallback: HTML scraping with requests
-    session = _init_nse_session()
+    if not USE_SELENIUM_FALLBACK:
+        raise RuntimeError("API fetch failed and Selenium fallback disabled")
+
+    driver = _build_driver(headless=headless)
     try:
-        html = _fetch_html(session, CORP_ACTIONS_URL, params={"symbol": symbol})
+        driver.get(NSE_BASE_URL)
+
+        url = f"{CORP_ACTIONS_URL}?symbol={symbol}"
+        driver.get(url)
+
+        wait = WebDriverWait(driver, 15)
+        wait.until(EC.presence_of_element_located((By.ID, "CFcorpactionsEquityTable")))
+
+        html = driver.page_source
         return _parse_corporate_actions_table(html)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch corporate actions for {symbol}: {e}")
+    finally:
+        driver.quit()
 
 
 def _fetch_announcements_api(symbol: str) -> List[Dict]:
@@ -576,24 +575,77 @@ def _fetch_announcements_api(symbol: str) -> List[Dict]:
 
 def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Fetch announcements for the given symbol via API (if available), fallback to HTML scraping.
+    Fetch announcements for the given symbol via API (if available), fallback to Selenium scraping.
     """
     symbol = symbol.upper().strip()
 
-    # Try API first - but always fall back to HTML scraping if empty or fails
+    # Try API first - but always fall back to Selenium if empty or fails
     try:
         rows = _fetch_announcements_api(symbol)
         # Only use API results if we got actual data
         if rows and len(rows) > 0:
             return rows
     except Exception:
-        # API failed, continue to HTML scraping
+        # API failed, continue to Selenium
         pass
 
-    # Fallback: HTML scraping with requests
-    session = _init_nse_session()
+    if not USE_SELENIUM_FALLBACK:
+        raise RuntimeError("API fetch failed and Selenium fallback disabled")
+
+    driver = _build_driver(headless=headless)
     try:
-        html = _fetch_html(session, ANNOUNCEMENTS_URL, params={"symbol": symbol})
-        return _parse_announcements_table(html)
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch announcements for {symbol}: {e}")
+        print(f"[DEBUG] Loading NSE base URL...")
+        driver.get(NSE_BASE_URL)
+        time.sleep(2)  # Wait for cookies/session
+
+        url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
+        print(f"[DEBUG] Loading announcements URL: {url}")
+        driver.get(url)
+        
+        # Wait longer for table to load - try multiple strategies
+        wait = WebDriverWait(driver, 25)
+        table_found = False
+        
+        # Strategy 1: Wait for table by ID
+        try:
+            wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
+            # Also wait for it to be visible and have rows
+            wait.until(EC.visibility_of_element_located((By.ID, "CFanncEquityTable")))
+            time.sleep(2)  # Additional wait for dynamic content
+            table_found = True
+            print(f"[DEBUG] Table CFanncEquityTable found and visible")
+        except Exception as e:
+            print(f"[DEBUG] Table not found with ID CFanncEquityTable: {str(e)}")
+        
+        # Strategy 2: Try alternative selectors
+        if not table_found:
+            try:
+                # Wait for any table with 'annc' in ID
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table[id*='annc']")))
+                time.sleep(2)
+                table_found = True
+                print(f"[DEBUG] Found table with alternative selector")
+            except:
+                pass
+        
+        # Strategy 3: Wait for tbody with rows
+        if not table_found:
+            try:
+                wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, "table#CFanncEquityTable tbody tr")) > 0)
+                time.sleep(2)
+                table_found = True
+                print(f"[DEBUG] Found table rows")
+            except:
+                pass
+        
+        # Final wait for any dynamic loading
+        if table_found:
+            time.sleep(3)
+        else:
+            time.sleep(5)
+
+        html = driver.page_source
+        rows = _parse_announcements_table(html)
+        return rows
+    finally:
+        driver.quit()
