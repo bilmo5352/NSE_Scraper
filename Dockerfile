@@ -2,20 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    CHROME_BIN=/usr/bin/chromium \
-    CHROMEDRIVER_PATH=/usr/bin/chromedriver \
     PORT=8000 \
     DEBIAN_FRONTEND=noninteractive
-
-# Install Chromium + Chromedriver + basic fonts
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        chromium \
-        chromium-driver \
-        fonts-dejavu \
-        ca-certificates \
-        curl && \
-    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -26,4 +14,4 @@ COPY . .
 
 EXPOSE 8000
 
-CMD ["bash", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 1 --timeout 120"]
+CMD ["bash", "-c", "gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 2 --threads 4 --timeout 120"]
