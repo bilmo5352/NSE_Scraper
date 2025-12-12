@@ -697,9 +697,14 @@ def _parse_announcements_table(html: str) -> List[Dict]:
 def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
     Fetch announcements for the given symbol. Prefers API, falls back to Selenium only if needed.
+    Uses strengthened waits to properly wait for table rows without crashing Chrome.
     
-    Short-term: In production, if API returns empty, raise an error instead of using Selenium.
-    Medium-term: When Selenium is re-enabled, ensures proper cleanup and timeouts.
+    Strategy:
+    - If API returns any rows, skip Selenium entirely
+    - Wait for table element, then wait for at least one row
+    - Only scroll after rows exist and only if needed (1-2 iterations max)
+    - Fail cleanly on timeout instead of continuing with scrolls/sleeps
+    - Always ensure driver.quit() runs in finally block
     """
     symbol = symbol.upper().strip()
     logger.info(f"get_announcements_for_symbol: Starting for symbol {symbol}")
@@ -733,155 +738,97 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         # First visit base URL to set cookies and establish session
         base_url = NSE_BASE_URL
         logger.info(f"get_announcements_for_symbol: Navigating to base URL: {base_url}")
-        try:
-            driver.set_page_load_timeout(30)
-            driver.get(base_url)
-            # Wait for page to be ready with shorter timeout
-            WebDriverWait(driver, 15).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(2)  # Give time for cookies and session to be established
-            logger.info(f"get_announcements_for_symbol: Base URL loaded, cookies set")
-        except (WebDriverException, TimeoutException) as e:
-            logger.error(f"get_announcements_for_symbol: Error loading base URL: {str(e)}")
-            raise
+        driver.set_page_load_timeout(30)
+        driver.get(base_url)
+        # Wait for page to be ready
+        WebDriverWait(driver, 15).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(2)  # Give time for cookies and session to be established
+        logger.info(f"get_announcements_for_symbol: Base URL loaded, cookies set")
 
-        # Navigate to announcements page with defensive approach
+        # Navigate to announcements page
         url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
         logger.info(f"get_announcements_for_symbol: Navigating to announcements URL: {url}")
+        driver.set_page_load_timeout(45)
+        driver.get(url)
+        # Wait for page to be ready
         try:
-            # Set a reasonable page load timeout
-            driver.set_page_load_timeout(45)
-            driver.get(url)
-            
-            # Wait for page to be ready, but don't wait too long
-            try:
-                WebDriverWait(driver, 25).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-            except TimeoutException:
-                logger.warning(f"get_announcements_for_symbol: Page readyState timeout, continuing anyway")
-            
-            time.sleep(3)  # Additional wait for dynamic content
-            logger.info(f"get_announcements_for_symbol: Announcements page loaded")
-        except (WebDriverException, TimeoutException) as e:
-            logger.error(f"get_announcements_for_symbol: Error loading announcements URL: {str(e)}")
-            raise
+            WebDriverWait(driver, 25).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            logger.warning(f"get_announcements_for_symbol: Page readyState timeout, continuing anyway")
+        logger.info(f"get_announcements_for_symbol: Announcements page loaded")
         
-        # Wait for any content to appear first (more defensive)
-        # Use shorter waits with checks to prevent Chrome from hanging/crashing
-        wait = WebDriverWait(driver, 30)  # Reduced from 60 to prevent long hangs
+        # Strengthened waits: wait for table, then wait for at least one row
+        wait = WebDriverWait(driver, 40)  # Longer timeout just for announcements
         try:
-            # First, wait for body to be present (page is loading)
-            logger.info(f"get_announcements_for_symbol: Waiting for page body")
-            try:
-                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            except TimeoutException:
-                # Check if driver is still alive
-                try:
-                    driver.title
-                except:
-                    raise WebDriverException("Chrome driver crashed while waiting for body")
-            time.sleep(2)
-            
-            # Then wait for table to load with periodic health checks
+            # 1) Wait for table element
             logger.info(f"get_announcements_for_symbol: Waiting for table CFanncEquityTable")
-            # Try to find table with periodic checks
-            table_found = False
-            for attempt in range(6):  # 6 attempts * 5 seconds = 30 seconds max
-                try:
-                    # Check if driver is still alive
-                    driver.current_url
-                    # Try to find table
-                    table = driver.find_element(By.ID, "CFanncEquityTable")
-                    table_found = True
-                    logger.info(f"get_announcements_for_symbol: Table found on attempt {attempt + 1}")
-                    break
-                except Exception as e:
-                    if attempt < 5:
-                        time.sleep(5)  # Wait 5 seconds between attempts
-                        logger.debug(f"get_announcements_for_symbol: Table not found yet, attempt {attempt + 1}/6")
-                    else:
-                        raise TimeoutException(f"Table not found after 6 attempts: {str(e)}")
+            table = wait.until(
+                EC.presence_of_element_located((By.ID, "CFanncEquityTable"))
+            )
+            logger.info(f"get_announcements_for_symbol: Table found")
             
-            if not table_found:
-                raise TimeoutException("Table element not found after multiple attempts")
-            
-            time.sleep(2)  # Give it time to render
-            
-        except (TimeoutException, WebDriverException) as e:
-            # Try to get debugging info before failing
-            try:
-                page_title = driver.title
-                page_url = driver.current_url
-                logger.error(f"get_announcements_for_symbol: Page title: {page_title}, URL: {page_url}")
-                # Check if page loaded but table doesn't exist
-                try:
-                    body_text = driver.find_element(By.TAG_NAME, "body").text[:200]
-                    logger.error(f"get_announcements_for_symbol: Body text preview: {body_text}")
-                except:
-                    pass
-            except Exception as debug_e:
-                logger.error(f"get_announcements_for_symbol: Could not get debug info: {str(debug_e)}")
-            error_msg = f"Timeout waiting for announcements table to appear: {str(e)}"
-            logger.error(f"get_announcements_for_symbol: {error_msg}")
-            raise TimeoutException(error_msg) from e
-        
-        # Wait for table body to have at least one row - if this times out, bail gracefully
-        try:
+            # 2) Wait for at least one row in tbody
             logger.info(f"get_announcements_for_symbol: Waiting for table rows")
-            # Wait for at least one row to be present
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")))
-            # Additional wait to ensure rows are loaded
-            time.sleep(2)
-            # Verify rows exist
-            rows_found = driver.find_elements(By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")
-            if not rows_found:
-                raise TimeoutException("No table rows found after wait")
-            logger.info(f"get_announcements_for_symbol: Table rows found ({len(rows_found)} rows)")
+            wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")
+                )
+            )
+            logger.info(f"get_announcements_for_symbol: Table rows found")
+            
+            # Get HTML and parse immediately after rows appear
+            html = driver.page_source
+            rows = _parse_announcements_table(html)
+            logger.info(f"get_announcements_for_symbol: Parsed {len(rows)} rows from table")
+            
+            # Only scroll AFTER rows exist and only if needed to trigger lazy loading
+            # Limit to 1-2 iterations with condition check
+            if rows and len(rows) > 0:
+                initial_count = len(rows)
+                # Try scrolling once to trigger lazy loading if needed
+                try:
+                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(2)
+                    html = driver.page_source
+                    rows_after_scroll = _parse_announcements_table(html)
+                    # Only use new rows if count increased
+                    if len(rows_after_scroll) > initial_count:
+                        rows = rows_after_scroll
+                        logger.info(f"get_announcements_for_symbol: After scroll, found {len(rows)} rows (was {initial_count})")
+                    else:
+                        logger.info(f"get_announcements_for_symbol: Scroll did not increase row count, keeping original {initial_count} rows")
+                except WebDriverException as e:
+                    logger.warning(f"get_announcements_for_symbol: Error during scroll: {str(e)}, using existing rows")
+            
+            return rows
+            
         except TimeoutException as e:
-            # Check if table exists but is empty
-            try:
-                table = driver.find_element(By.ID, "CFanncEquityTable")
-                tbody = table.find_element(By.TAG_NAME, "tbody")
-                rows_in_tbody = tbody.find_elements(By.TAG_NAME, "tr")
-                logger.warning(f"get_announcements_for_symbol: Table exists but has {len(rows_in_tbody)} rows")
-            except:
-                pass
-            error_msg = f"Timeout waiting for announcements table rows to appear: {str(e)}"
+            # Fail cleanly on timeout - return empty list or raise controlled error
+            error_msg = f"Timeout waiting for announcements table/rows: {str(e)}"
             logger.error(f"get_announcements_for_symbol: {error_msg}")
-            raise TimeoutException(error_msg) from e
-        
-        # Additional wait for table content to render completely
-        time.sleep(3)
-
-        html = driver.page_source
-        rows = _parse_announcements_table(html)
-        logger.info(f"get_announcements_for_symbol: Parsed {len(rows)} rows from table")
-        
-        # If still empty, try waiting a bit more and check again
-        # Sometimes the table loads but rows populate via JavaScript
-        if not rows:
-            logger.warning(f"get_announcements_for_symbol: No rows found, retrying with scroll and longer wait")
-            time.sleep(5)  # Longer wait
+            # Try to get page source anyway in case table exists but wait failed
             try:
-                # Try scrolling to trigger lazy loading if any
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(3)
-                # Scroll back up
-                driver.execute_script("window.scrollTo(0, 0);")
-                time.sleep(2)
                 html = driver.page_source
                 rows = _parse_announcements_table(html)
-                logger.info(f"get_announcements_for_symbol: After scroll, parsed {len(rows)} rows")
-            except WebDriverException as e:
-                logger.error(f"get_announcements_for_symbol: WebDriverException during scroll/retry: {str(e)}")
-                # Driver may have died, but we'll return what we have
-        
-        return rows
-    except (TimeoutException, WebDriverException, Exception) as e:
-        # Re-raise the exception after ensuring cleanup
-        logger.error(f"get_announcements_for_symbol: Exception occurred: {str(e)}")
+                if rows and len(rows) > 0:
+                    logger.warning(f"get_announcements_for_symbol: Found {len(rows)} rows despite timeout, returning them")
+                    return rows
+            except Exception:
+                pass
+            # If no rows found, raise timeout exception
+            raise TimeoutException(error_msg) from e
+            
+    except (WebDriverException, TimeoutException) as e:
+        # Catch WebDriverException to prevent multiple Selenium calls after fatal browser error
+        logger.error(f"get_announcements_for_symbol: Selenium error: {str(e)}")
+        raise
+    except Exception as e:
+        # Catch any other exceptions
+        logger.error(f"get_announcements_for_symbol: Unexpected error: {str(e)}")
         raise
     finally:
         # Always ensure driver is closed, even on timeout or parsing errors
