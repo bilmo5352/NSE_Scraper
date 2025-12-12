@@ -1,6 +1,7 @@
 import os
 import shutil
 import time
+import logging
 from typing import List, Dict
 
 import requests
@@ -11,7 +12,11 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 
 NSE_BASE_URL = "https://www.nseindia.com"
@@ -92,19 +97,24 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
     
     if chrome_bin:
         if not os.path.exists(chrome_bin):
-            raise RuntimeError(f"Chrome binary not found at {chrome_bin}")
+            error_msg = f"Chrome binary not found at {chrome_bin}"
+            logger.error(f"_build_driver: {error_msg}")
+            raise RuntimeError(error_msg)
         chrome_options.binary_location = chrome_bin
     else:
         # Try to find it anyway
         found = shutil.which("chromium") or shutil.which("chromium-browser")
         if found:
+            chrome_bin = found
             chrome_options.binary_location = found
 
     # Prefer preinstalled chromedriver if available
     chromedriver_path = os.environ.get("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
     if chromedriver_path:
         if not os.path.exists(chromedriver_path):
-            raise RuntimeError(f"ChromeDriver not found at {chromedriver_path}")
+            error_msg = f"ChromeDriver not found at {chromedriver_path}"
+            logger.error(f"_build_driver: {error_msg}")
+            raise RuntimeError(error_msg)
         service = Service(chromedriver_path)
     else:
         # Try to find chromedriver in common locations
@@ -115,7 +125,11 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
                 break
         else:
             # Last resort: use ChromeDriverManager
+            chromedriver_path = "ChromeDriverManager"
             service = Service(ChromeDriverManager().install())
+
+    # Log Chrome binary and ChromeDriver paths
+    logger.info(f"_build_driver: Chrome binary: {chrome_bin}, ChromeDriver: {chromedriver_path}")
 
     try:
         driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -127,6 +141,7 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
             error_msg += f" (Chrome binary: {chrome_bin})"
         if chromedriver_path:
             error_msg += f" (ChromeDriver: {chromedriver_path})"
+        logger.error(f"_build_driver: {error_msg}")
         raise RuntimeError(error_msg) from e
 
 
@@ -246,12 +261,13 @@ def _fetch_event_calendar_api(symbol: str) -> List[Dict]:
 def _fetch_announcements_api(symbol: str) -> List[Dict]:
     """
     Try to fetch announcements via API. 
-    Note: The NSE API may not support announcements, so this often returns empty.
+    Returns immediately if any type returns data (strict API-first approach).
     """
     session = _init_nse_session()
     # Try different possible type values
     for api_type in ["Announcement", "Corporate Announcement", "Announcements"]:
         try:
+            logger.info(f"_fetch_announcements_api: Trying API type '{api_type}' for symbol {symbol}")
             resp = session.get(
                 CORP_FILING_API,
                 params={"index": "equities", "symbol": symbol, "type": api_type},
@@ -261,8 +277,9 @@ def _fetch_announcements_api(symbol: str) -> List[Dict]:
             payload = resp.json()
             items = payload.get("data") or payload.get("rows") or payload or []
             
-            # If we got items, process them
+            # If we got items, process them and return immediately
             if items and len(items) > 0:
+                logger.info(f"_fetch_announcements_api: Found {len(items)} items for type '{api_type}'")
                 rows: List[Dict] = []
                 for item in items:
                     rows.append(
@@ -278,11 +295,14 @@ def _fetch_announcements_api(symbol: str) -> List[Dict]:
                         }
                     )
                 if rows:
+                    logger.info(f"_fetch_announcements_api: Returning {len(rows)} rows from API")
                     return rows
-        except Exception:
+        except Exception as e:
+            logger.debug(f"_fetch_announcements_api: API type '{api_type}' failed: {str(e)}")
             continue
     
     # No API type worked, return empty
+    logger.info(f"_fetch_announcements_api: No API data found for symbol {symbol}")
     return []
 
 
@@ -664,63 +684,91 @@ def _parse_announcements_table(html: str) -> List[Dict]:
 
 def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
-    Fetch announcements for the given symbol. Uses Selenium since API may not be available.
+    Fetch announcements for the given symbol. Prefers API, falls back to Selenium only if needed.
     """
     symbol = symbol.upper().strip()
+    logger.info(f"get_announcements_for_symbol: Starting for symbol {symbol}")
 
-    # Try API first (may not work for announcements - API might not support this type)
-    # But if it returns empty, we still want to try Selenium
-    api_rows = []
+    # Try API first - if it returns data, skip Selenium entirely
     try:
         api_rows = _fetch_announcements_api(symbol)
         # Only return API results if we actually got data
         if api_rows and len(api_rows) > 0:
+            logger.info(f"get_announcements_for_symbol: Returning {len(api_rows)} rows from API, skipping Selenium")
             return api_rows
-    except Exception:
+    except Exception as e:
+        logger.warning(f"get_announcements_for_symbol: API fetch failed: {str(e)}, falling back to Selenium")
         # API failed, continue to Selenium
-        pass
 
     # API returned empty or failed, use Selenium
     if not USE_SELENIUM_FALLBACK:
         raise RuntimeError("API fetch failed and Selenium fallback disabled")
 
-    driver = _build_driver(headless=headless)
+    logger.info(f"get_announcements_for_symbol: Starting Selenium for symbol {symbol}")
+    driver = None
     try:
+        driver = _build_driver(headless=headless)
+        
         # First visit base URL to set cookies
-        driver.get(NSE_BASE_URL)
+        base_url = NSE_BASE_URL
+        logger.info(f"get_announcements_for_symbol: Navigating to base URL: {base_url}")
+        driver.get(base_url)
         time.sleep(2)  # Give time for cookies to be set
 
         # Navigate to announcements page
         url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
+        logger.info(f"get_announcements_for_symbol: Navigating to announcements URL: {url}")
         driver.get(url)
         
-        # Wait for table to load
-        wait = WebDriverWait(driver, 20)
-        wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
-        
-        # Wait for table body to have at least one row
+        # Wait for table to load with longer timeout for announcements page
+        wait = WebDriverWait(driver, 40)
         try:
-            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")))
-        except Exception:
-            # If no rows found, wait a bit more
-            time.sleep(5)
+            logger.info(f"get_announcements_for_symbol: Waiting for table CFanncEquityTable")
+            wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
+            logger.info(f"get_announcements_for_symbol: Table found")
+        except TimeoutException as e:
+            error_msg = f"Timeout waiting for announcements table to appear: {str(e)}"
+            logger.error(f"get_announcements_for_symbol: {error_msg}")
+            raise TimeoutException(error_msg) from e
         
-        # Additional wait for table content to render (table might be there but empty initially)
+        # Wait for table body to have at least one row - if this times out, bail gracefully
+        try:
+            logger.info(f"get_announcements_for_symbol: Waiting for table rows")
+            wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")))
+            logger.info(f"get_announcements_for_symbol: Table rows found")
+        except TimeoutException as e:
+            error_msg = f"Timeout waiting for announcements table rows to appear: {str(e)}"
+            logger.error(f"get_announcements_for_symbol: {error_msg}")
+            raise TimeoutException(error_msg) from e
+        
+        # Additional wait for table content to render
         time.sleep(3)
 
         html = driver.page_source
         rows = _parse_announcements_table(html)
+        logger.info(f"get_announcements_for_symbol: Parsed {len(rows)} rows from table")
         
         # If still empty, try waiting a bit more and check again
         # Sometimes the table loads but rows populate via JavaScript
         if not rows:
+            logger.warning(f"get_announcements_for_symbol: No rows found, retrying with scroll")
             time.sleep(3)
-            # Try scrolling to trigger lazy loading if any
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            html = driver.page_source
-            rows = _parse_announcements_table(html)
+            try:
+                # Try scrolling to trigger lazy loading if any
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(2)
+                html = driver.page_source
+                rows = _parse_announcements_table(html)
+                logger.info(f"get_announcements_for_symbol: After scroll, parsed {len(rows)} rows")
+            except WebDriverException as e:
+                logger.error(f"get_announcements_for_symbol: WebDriverException during scroll/retry: {str(e)}")
+                # Driver may have died, but we'll return what we have
         
         return rows
     finally:
-        driver.quit()
+        if driver:
+            try:
+                driver.quit()
+                logger.info(f"get_announcements_for_symbol: Driver closed")
+            except Exception as e:
+                logger.warning(f"get_announcements_for_symbol: Error closing driver: {str(e)}")

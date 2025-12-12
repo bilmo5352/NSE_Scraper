@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from werkzeug.exceptions import BadRequest
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from scraper import (
     get_event_calendar_for_symbol,
@@ -189,19 +190,66 @@ def create_app():
         if not symbol:
             raise BadRequest("Query parameter 'symbol' is required")
 
+        # Try API fetch separately to differentiate errors
+        api_error = None
+        selenium_error = None
+        
         try:
             rows = get_announcements_for_symbol(symbol, headless=True)
-        except Exception as e:
+        except TimeoutException as e:
+            # Selenium timeout
+            selenium_error = str(e)
             return (
                 jsonify(
                     {
                         "symbol": symbol.upper(),
-                        "error": "scrape_failed",
-                        "message": str(e),
+                        "error": "selenium_timeout",
+                        "message": f"Selenium timeout: {selenium_error}",
                     }
                 ),
                 500,
             )
+        except WebDriverException as e:
+            # Selenium driver error
+            selenium_error = str(e)
+            return (
+                jsonify(
+                    {
+                        "symbol": symbol.upper(),
+                        "error": "selenium_driver_error",
+                        "message": f"Selenium driver error: {selenium_error}",
+                    }
+                ),
+                500,
+            )
+        except Exception as e:
+            # Check if it's an API error or Selenium error based on message
+            error_msg = str(e)
+            if "API" in error_msg or "fetch" in error_msg.lower():
+                api_error = error_msg
+                return (
+                    jsonify(
+                        {
+                            "symbol": symbol.upper(),
+                            "error": "api_fetch_failed",
+                            "message": f"API fetch failed: {api_error}",
+                        }
+                    ),
+                    500,
+                )
+            else:
+                # Assume Selenium error
+                selenium_error = error_msg
+                return (
+                    jsonify(
+                        {
+                            "symbol": symbol.upper(),
+                            "error": "selenium_error",
+                            "message": f"Selenium error: {selenium_error}",
+                        }
+                    ),
+                    500,
+                )
 
         return jsonify(
             {
