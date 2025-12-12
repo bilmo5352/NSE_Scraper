@@ -27,6 +27,8 @@ ANNOUNCEMENTS_URL = NSE_BASE_URL + "/companies-listing/corporate-filings-announc
 CORP_FILING_API = NSE_BASE_URL + "/api/corporate-filing"
 CORP_ACTIONS_API = NSE_BASE_URL + "/api/corporate-actions"
 USE_SELENIUM_FALLBACK = os.environ.get("USE_SELENIUM_FALLBACK", "true").lower() == "true"
+# Disable Selenium for announcements in production if API returns empty
+DISABLE_ANNOUNCEMENTS_SELENIUM = os.environ.get("DISABLE_ANNOUNCEMENTS_SELENIUM", "false").lower() == "true"
 
 DEFAULT_HEADERS = {
     "user-agent": (
@@ -685,11 +687,16 @@ def _parse_announcements_table(html: str) -> List[Dict]:
 def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
     Fetch announcements for the given symbol. Prefers API, falls back to Selenium only if needed.
+    
+    Short-term: In production, if API returns empty, raise an error instead of using Selenium.
+    Medium-term: When Selenium is re-enabled, ensures proper cleanup and timeouts.
     """
     symbol = symbol.upper().strip()
     logger.info(f"get_announcements_for_symbol: Starting for symbol {symbol}")
 
     # Try API first - if it returns data, skip Selenium entirely
+    api_rows = []
+    api_error = None
     try:
         api_rows = _fetch_announcements_api(symbol)
         # Only return API results if we actually got data
@@ -697,10 +704,19 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
             logger.info(f"get_announcements_for_symbol: Returning {len(api_rows)} rows from API, skipping Selenium")
             return api_rows
     except Exception as e:
-        logger.warning(f"get_announcements_for_symbol: API fetch failed: {str(e)}, falling back to Selenium")
-        # API failed, continue to Selenium
+        api_error = str(e)
+        logger.warning(f"get_announcements_for_symbol: API fetch failed: {api_error}")
+        # API failed, continue to Selenium if enabled
 
-    # API returned empty or failed, use Selenium
+    # Short-term guard: If API returned empty and Selenium is disabled for announcements, return error
+    if DISABLE_ANNOUNCEMENTS_SELENIUM:
+        error_msg = "announcements API empty; Selenium disabled in production"
+        if api_error:
+            error_msg += f" (API error: {api_error})"
+        logger.error(f"get_announcements_for_symbol: {error_msg}")
+        raise RuntimeError(error_msg)
+
+    # API returned empty or failed, use Selenium (if enabled)
     if not USE_SELENIUM_FALLBACK:
         raise RuntimeError("API fetch failed and Selenium fallback disabled")
 
@@ -712,13 +728,21 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         # First visit base URL to set cookies
         base_url = NSE_BASE_URL
         logger.info(f"get_announcements_for_symbol: Navigating to base URL: {base_url}")
-        driver.get(base_url)
-        time.sleep(2)  # Give time for cookies to be set
+        try:
+            driver.get(base_url)
+            time.sleep(2)  # Give time for cookies to be set
+        except (WebDriverException, TimeoutException) as e:
+            logger.error(f"get_announcements_for_symbol: Error loading base URL: {str(e)}")
+            raise
 
         # Navigate to announcements page
         url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
         logger.info(f"get_announcements_for_symbol: Navigating to announcements URL: {url}")
-        driver.get(url)
+        try:
+            driver.get(url)
+        except (WebDriverException, TimeoutException) as e:
+            logger.error(f"get_announcements_for_symbol: Error loading announcements URL: {str(e)}")
+            raise
         
         # Wait for table to load with longer timeout for announcements page
         wait = WebDriverWait(driver, 40)
@@ -765,7 +789,12 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
                 # Driver may have died, but we'll return what we have
         
         return rows
+    except (TimeoutException, WebDriverException, Exception) as e:
+        # Re-raise the exception after ensuring cleanup
+        logger.error(f"get_announcements_for_symbol: Exception occurred: {str(e)}")
+        raise
     finally:
+        # Always ensure driver is closed, even on timeout or parsing errors
         if driver:
             try:
                 driver.quit()

@@ -4,6 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     CHROME_BIN=/usr/bin/chromium \
     CHROMEDRIVER_PATH=/usr/bin/chromedriver \
+    DISABLE_ANNOUNCEMENTS_SELENIUM=true \
     PORT=8000
 
 # Install chromium and chromedriver with required dependencies
