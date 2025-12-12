@@ -910,9 +910,11 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
     driver = None
     try:
         driver = _build_driver(headless=headless)
-        # Set longer timeouts for announcements page
-        driver.set_page_load_timeout(90)
-        driver.set_script_timeout(90)
+        # Set longer timeouts for announcements page (match wait timeout)
+        # Production may need more time, so use configurable timeout
+        page_timeout = int(os.environ.get("ANNOUNCEMENTS_PAGE_TIMEOUT", "120"))
+        driver.set_page_load_timeout(page_timeout)
+        driver.set_script_timeout(page_timeout)
         
         # First visit base URL to set cookies and establish session
         base_url = NSE_BASE_URL
@@ -970,11 +972,16 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         # Use robust waiting for table rows (waits for actual row count > 0)
         table_selector = "#CFanncEquityTable"
         logger.info(f"get_announcements_for_symbol: Waiting for table rows using robust waiter")
+        
+        # Use longer timeout in production (Railway) - check environment or use default
+        # Production may be slower, so give it more time
+        wait_timeout = int(os.environ.get("ANNOUNCEMENTS_WAIT_TIMEOUT", "120"))  # Default 120s, configurable
+        
         try:
             html = wait_for_table_rows(
                 driver, 
                 table_selector, 
-                timeout=90,  # Longer timeout for slow announcements table
+                timeout=wait_timeout,  # Longer timeout for slow announcements table (120s default)
                 poll=0.5, 
                 use_pending_requests=True
             )
@@ -1006,18 +1013,22 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
             return rows
             
         except TimeoutException as e:
-            # Fail cleanly on timeout - save debug artifacts and raise
-            error_msg = f"Timeout waiting for announcements table rows: {str(e)}"
-            logger.error(f"get_announcements_for_symbol: {error_msg}")
-            # Try to get page source anyway in case table exists but wait failed
+            # Fail cleanly on timeout - save debug artifacts and try fallback parsing
+            error_msg = f"Timeout waiting for announcements table rows after {wait_timeout}s: {str(e)}"
+            logger.warning(f"get_announcements_for_symbol: {error_msg}")
+            # IMPORTANT: Try to get page source anyway in case table exists but wait failed
+            # This handles cases where table loads slowly but eventually appears
             try:
                 html = driver.page_source
                 rows = _parse_announcements_table(html)
                 if rows and len(rows) > 0:
-                    logger.warning(f"get_announcements_for_symbol: Found {len(rows)} rows despite timeout, returning them")
+                    logger.warning(f"get_announcements_for_symbol: Found {len(rows)} rows despite timeout, returning them (this is OK)")
                     return rows
-            except Exception:
-                pass
+                else:
+                    logger.error(f"get_announcements_for_symbol: No rows found in page source after timeout")
+            except Exception as parse_error:
+                logger.error(f"get_announcements_for_symbol: Error parsing page source after timeout: {str(parse_error)}")
+            
             # If no rows found, raise timeout exception (debug artifacts already saved by wait_for_table_rows)
             raise TimeoutException(error_msg) from e
             
