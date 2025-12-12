@@ -54,7 +54,12 @@ def _build_driver(headless: bool = True) -> webdriver.Chrome:
     chrome_options.add_argument("--disable-setuid-sandbox")
     chrome_options.add_argument("--window-size=1280,720")
     chrome_options.add_argument("--memory-pressure-off")
+    chrome_options.add_argument("--max_old_space_size=512")
     chrome_options.add_argument("--disable-web-security")
+    chrome_options.add_argument("--disable-impl-side-painting")
+    chrome_options.add_argument("--disable-accelerated-2d-canvas")
+    chrome_options.add_argument("--disable-accelerated-video-decode")
+    chrome_options.add_argument("--js-flags=--max-old-space-size=512")
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--ignore-certificate-errors")
     chrome_options.add_argument("--ignore-ssl-errors")
@@ -729,50 +734,95 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         base_url = NSE_BASE_URL
         logger.info(f"get_announcements_for_symbol: Navigating to base URL: {base_url}")
         try:
+            driver.set_page_load_timeout(30)
             driver.get(base_url)
-            # Wait for page to be ready
+            # Wait for page to be ready with shorter timeout
             WebDriverWait(driver, 15).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(3)  # Give time for cookies and session to be established
+            time.sleep(2)  # Give time for cookies and session to be established
             logger.info(f"get_announcements_for_symbol: Base URL loaded, cookies set")
         except (WebDriverException, TimeoutException) as e:
             logger.error(f"get_announcements_for_symbol: Error loading base URL: {str(e)}")
             raise
 
-        # Navigate to announcements page
+        # Navigate to announcements page with defensive approach
         url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
         logger.info(f"get_announcements_for_symbol: Navigating to announcements URL: {url}")
         try:
+            # Set a reasonable page load timeout
+            driver.set_page_load_timeout(45)
             driver.get(url)
-            # Wait for page to be ready
-            WebDriverWait(driver, 20).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(2)  # Additional wait for dynamic content
+            
+            # Wait for page to be ready, but don't wait too long
+            try:
+                WebDriverWait(driver, 25).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+            except TimeoutException:
+                logger.warning(f"get_announcements_for_symbol: Page readyState timeout, continuing anyway")
+            
+            time.sleep(3)  # Additional wait for dynamic content
             logger.info(f"get_announcements_for_symbol: Announcements page loaded")
         except (WebDriverException, TimeoutException) as e:
             logger.error(f"get_announcements_for_symbol: Error loading announcements URL: {str(e)}")
             raise
         
-        # Wait for table to load with longer timeout for announcements page
-        wait = WebDriverWait(driver, 50)  # Increased timeout
+        # Wait for any content to appear first (more defensive)
+        # Use shorter waits with checks to prevent Chrome from hanging/crashing
+        wait = WebDriverWait(driver, 30)  # Reduced from 60 to prevent long hangs
         try:
+            # First, wait for body to be present (page is loading)
+            logger.info(f"get_announcements_for_symbol: Waiting for page body")
+            try:
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            except TimeoutException:
+                # Check if driver is still alive
+                try:
+                    driver.title
+                except:
+                    raise WebDriverException("Chrome driver crashed while waiting for body")
+            time.sleep(2)
+            
+            # Then wait for table to load with periodic health checks
             logger.info(f"get_announcements_for_symbol: Waiting for table CFanncEquityTable")
-            # Wait for table to be present and visible
-            wait.until(EC.presence_of_element_located((By.ID, "CFanncEquityTable")))
-            # Additional check that table is actually in DOM and has content
-            table = driver.find_element(By.ID, "CFanncEquityTable")
-            if not table:
-                raise TimeoutException("Table element not found after presence check")
-            logger.info(f"get_announcements_for_symbol: Table found")
-        except TimeoutException as e:
-            # Try to get page source for debugging
+            # Try to find table with periodic checks
+            table_found = False
+            for attempt in range(6):  # 6 attempts * 5 seconds = 30 seconds max
+                try:
+                    # Check if driver is still alive
+                    driver.current_url
+                    # Try to find table
+                    table = driver.find_element(By.ID, "CFanncEquityTable")
+                    table_found = True
+                    logger.info(f"get_announcements_for_symbol: Table found on attempt {attempt + 1}")
+                    break
+                except Exception as e:
+                    if attempt < 5:
+                        time.sleep(5)  # Wait 5 seconds between attempts
+                        logger.debug(f"get_announcements_for_symbol: Table not found yet, attempt {attempt + 1}/6")
+                    else:
+                        raise TimeoutException(f"Table not found after 6 attempts: {str(e)}")
+            
+            if not table_found:
+                raise TimeoutException("Table element not found after multiple attempts")
+            
+            time.sleep(2)  # Give it time to render
+            
+        except (TimeoutException, WebDriverException) as e:
+            # Try to get debugging info before failing
             try:
                 page_title = driver.title
-                logger.error(f"get_announcements_for_symbol: Page title: {page_title}")
-            except:
-                pass
+                page_url = driver.current_url
+                logger.error(f"get_announcements_for_symbol: Page title: {page_title}, URL: {page_url}")
+                # Check if page loaded but table doesn't exist
+                try:
+                    body_text = driver.find_element(By.TAG_NAME, "body").text[:200]
+                    logger.error(f"get_announcements_for_symbol: Body text preview: {body_text}")
+                except:
+                    pass
+            except Exception as debug_e:
+                logger.error(f"get_announcements_for_symbol: Could not get debug info: {str(debug_e)}")
             error_msg = f"Timeout waiting for announcements table to appear: {str(e)}"
             logger.error(f"get_announcements_for_symbol: {error_msg}")
             raise TimeoutException(error_msg) from e
