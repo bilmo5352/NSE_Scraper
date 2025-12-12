@@ -2,6 +2,7 @@ import os
 import shutil
 import time
 import logging
+import traceback
 from typing import List, Dict
 
 import requests
@@ -13,10 +14,15 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.remote.webdriver import WebDriver
 from webdriver_manager.chrome import ChromeDriverManager
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+# Debug artifacts directory
+DEBUG_DIR = os.path.join(os.getcwd(), "scrape_debug")
+os.makedirs(DEBUG_DIR, exist_ok=True)
 
 
 NSE_BASE_URL = "https://www.nseindia.com"
@@ -174,6 +180,176 @@ def _init_nse_session() -> requests.Session:
     resp = session.get(NSE_BASE_URL, timeout=5)
     resp.raise_for_status()
     return session
+
+
+# Inject a small request counter to detect active fetch/xhr calls (optional but very helpful)
+INJECT_PENDING_REQUESTS = """
+if (!window.__pendingRequestsInjected) {
+  window.__pendingRequestsInjected = true;
+  window.__pendingRequests = 0;
+  (function(){
+    // wrap fetch
+    const origFetch = window.fetch;
+    if (origFetch) {
+      window.fetch = function() {
+        window.__pendingRequests++;
+        return origFetch.apply(this, arguments)
+          .finally(() => { window.__pendingRequests = Math.max(0, window.__pendingRequests - 1); });
+      };
+    }
+    // wrap XMLHttpRequest
+    const origOpen = XMLHttpRequest.prototype.open;
+    const origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function() {
+      window.__pendingRequests++;
+      this.addEventListener('readystatechange', function() {
+        if (this.readyState === 4) {
+          window.__pendingRequests = Math.max(0, window.__pendingRequests - 1);
+        }
+      }, false);
+      return origSend.apply(this, arguments);
+    };
+  })();
+}
+return window.__pendingRequests;
+"""
+
+
+def _count_table_rows_js(selector):
+    # JS returns an object {count: N, found: boolean}
+    return f"""
+    (function(sel){{
+      var els = document.querySelectorAll(sel);
+      if (!els || els.length === 0) return {{count:0, found:false}};
+      for (var i=0;i<els.length;i++){{
+        var el = els[i];
+        var tag = (el.tagName || '').toLowerCase();
+        if (tag === 'table') {{
+          var rows = el.querySelectorAll('tbody tr').length || el.querySelectorAll('tr').length;
+          return {{count: rows, found: rows>0}};
+        }} else if (tag === 'tr') {{
+          // selector already targets rows
+          return {{count: els.length, found: els.length>0}};
+        }} else {{
+          var rows2 = el.querySelectorAll('tr').length;
+          if (rows2 > 0) return {{count: rows2, found:true}};
+        }}
+      }}
+      return {{count:0, found:false}};
+    }})(arguments[0]);
+    """
+
+
+def _save_debug_artifacts(driver: WebDriver, prefix="debug"):
+    """Save screenshot and HTML for debugging on failure."""
+    ts = int(time.time())
+    base = f"{prefix}_{ts}"
+    screenshot = os.path.join(DEBUG_DIR, base + ".png")
+    htmlfile = os.path.join(DEBUG_DIR, base + ".html")
+    try:
+        driver.save_screenshot(screenshot)
+    except Exception as e:
+        screenshot = f"FAILED_SAVE_SCREENSHOT:{e}"
+    try:
+        with open(htmlfile, "w", encoding="utf-8") as fh:
+            fh.write(driver.page_source or "")
+    except Exception as e:
+        htmlfile = f"FAILED_SAVE_HTML:{e}"
+    return screenshot, htmlfile
+
+
+def wait_for_table_rows(driver: WebDriver, table_selector: str, timeout: int = 60, poll: float = 0.5, use_pending_requests: bool = True) -> str:
+    """
+    Wait until the table identified by `table_selector` has at least one row.
+    - table_selector: CSS selector that matches your table OR a container that holds rows.
+    - timeout: total seconds to wait
+    - poll: how often to check (seconds)
+    - use_pending_requests: injects JS wrapper to track fetch/XHR; waits for requests to settle as a fallback
+    Returns: page_source when successful (or raises TimeoutException + saves debug artifacts)
+    """
+    end = time.time() + timeout
+
+    # optionally inject request counter (best-effort)
+    try:
+        if use_pending_requests:
+            driver.execute_script(INJECT_PENDING_REQUESTS)
+    except Exception:
+        # not critical, continue
+        pass
+
+    last_pending_zero_time = None
+    while time.time() < end:
+        try:
+            # quick check via JS to count rows robustly (avoids StaleElement problems)
+            result = driver.execute_script(_count_table_rows_js(table_selector), table_selector)
+            if isinstance(result, dict):
+                count = int(result.get("count", 0))
+                found = bool(result.get("found", False))
+            else:
+                # fallback if driver returns something strange
+                count = int(result if isinstance(result, int) else 0)
+                found = count > 0
+
+            if found and count > 0:
+                # table rendered
+                logger.info(f"wait_for_table_rows: Found {count} rows in table")
+                return driver.page_source
+
+            # optional: check pending requests count (if we injected)
+            pending = None
+            try:
+                pending = driver.execute_script("return window.__pendingRequests !== undefined ? window.__pendingRequests : -1;")
+                # if pending === 0 record the time; only succeed if we've had 0 pending for a second or two
+                if isinstance(pending, (int, float)):
+                    if pending == 0:
+                        if last_pending_zero_time is None:
+                            last_pending_zero_time = time.time()
+                    else:
+                        last_pending_zero_time = None
+            except Exception:
+                pending = None
+
+            # if no rows but no pending requests for >1.0s, break (page likely done)
+            if pending == 0 and last_pending_zero_time and (time.time() - last_pending_zero_time) > 1.0:
+                # final check to see if rows showed up in the short interval
+                result = driver.execute_script(_count_table_rows_js(table_selector), table_selector)
+                count = int(result.get("count", 0)) if isinstance(result, dict) else int(result if isinstance(result, int) else 0)
+                if count > 0:
+                    logger.info(f"wait_for_table_rows: Found {count} rows after pending requests settled")
+                    return driver.page_source
+                # else let loop continue until timeout in case something else loads
+            time.sleep(poll)
+        except WebDriverException as wde:
+            # sometimes chromedriver throws transient errors; allow a short pause and retry
+            logger.debug(f"wait_for_table_rows: WebDriverException during wait: {str(wde)}, retrying...")
+            time.sleep(1.0)
+        except Exception as e:
+            # unexpected: save debug and re-raise after timeout
+            logger.debug(f"wait_for_table_rows: Unexpected exception during wait: {str(e)}")
+            pass
+
+    # timed out -> capture debug and raise
+    try:
+        sshot, html = _save_debug_artifacts(driver, prefix="wait_for_table_timeout")
+        logger.error(f"wait_for_table_rows: Timeout - saved debug artifacts: screenshot={sshot}, html={html}")
+    except Exception:
+        sshot, html = ("failed_to_save_screenshot", "failed_to_save_html")
+
+    try:
+        cur_url = driver.current_url
+    except Exception:
+        cur_url = "failed_to_get_current_url"
+
+    excerpt = ""
+    try:
+        page_src = driver.page_source or ""
+        excerpt = page_src[:2000]
+    except Exception:
+        excerpt = "<couldn't read page_source>"
+
+    err_msg = f"Timeout waiting for table rows (selector={table_selector}) after {timeout}s. current_url={cur_url}. screenshot={sshot}, html={html}"
+    logger.error(f"wait_for_table_rows: {err_msg}")
+    raise TimeoutException(err_msg)
 
 
 def _pick(item: Dict, keys, default="") -> str:
@@ -734,24 +910,54 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
     driver = None
     try:
         driver = _build_driver(headless=headless)
+        # Set longer timeouts for announcements page
+        driver.set_page_load_timeout(90)
+        driver.set_script_timeout(90)
         
         # First visit base URL to set cookies and establish session
         base_url = NSE_BASE_URL
         logger.info(f"get_announcements_for_symbol: Navigating to base URL: {base_url}")
-        driver.set_page_load_timeout(30)
-        driver.get(base_url)
+        # Try navigating (retry once on transient Nav errors)
+        tries = 0
+        while tries < 2:
+            tries += 1
+            try:
+                driver.get(base_url)
+                break
+            except Exception as e_nav:
+                if tries >= 2:
+                    logger.error(f"get_announcements_for_symbol: Error loading base URL after {tries} tries: {str(e_nav)}")
+                    raise
+                logger.warning(f"get_announcements_for_symbol: Retry {tries} loading base URL: {str(e_nav)}")
+                time.sleep(2)
+        
         # Wait for page to be ready
-        WebDriverWait(driver, 15).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except TimeoutException:
+            logger.warning(f"get_announcements_for_symbol: Base URL readyState timeout, continuing anyway")
         time.sleep(2)  # Give time for cookies and session to be established
         logger.info(f"get_announcements_for_symbol: Base URL loaded, cookies set")
 
         # Navigate to announcements page
         url = f"{ANNOUNCEMENTS_URL}?symbol={symbol}"
         logger.info(f"get_announcements_for_symbol: Navigating to announcements URL: {url}")
-        driver.set_page_load_timeout(45)
-        driver.get(url)
+        # Try navigating (retry once on transient Nav errors)
+        tries = 0
+        while tries < 2:
+            tries += 1
+            try:
+                driver.get(url)
+                break
+            except Exception as e_nav:
+                if tries >= 2:
+                    logger.error(f"get_announcements_for_symbol: Error loading announcements URL after {tries} tries: {str(e_nav)}")
+                    raise
+                logger.warning(f"get_announcements_for_symbol: Retry {tries} loading announcements URL: {str(e_nav)}")
+                time.sleep(2)
+        
         # Wait for page to be ready
         try:
             WebDriverWait(driver, 25).until(
@@ -761,32 +967,25 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
             logger.warning(f"get_announcements_for_symbol: Page readyState timeout, continuing anyway")
         logger.info(f"get_announcements_for_symbol: Announcements page loaded")
         
-        # Strengthened waits: wait for table, then wait for at least one row
-        wait = WebDriverWait(driver, 40)  # Longer timeout just for announcements
+        # Use robust waiting for table rows (waits for actual row count > 0)
+        table_selector = "#CFanncEquityTable"
+        logger.info(f"get_announcements_for_symbol: Waiting for table rows using robust waiter")
         try:
-            # 1) Wait for table element
-            logger.info(f"get_announcements_for_symbol: Waiting for table CFanncEquityTable")
-            table = wait.until(
-                EC.presence_of_element_located((By.ID, "CFanncEquityTable"))
+            html = wait_for_table_rows(
+                driver, 
+                table_selector, 
+                timeout=90,  # Longer timeout for slow announcements table
+                poll=0.5, 
+                use_pending_requests=True
             )
-            logger.info(f"get_announcements_for_symbol: Table found")
+            logger.info(f"get_announcements_for_symbol: Table rows found, parsing HTML")
             
-            # 2) Wait for at least one row in tbody
-            logger.info(f"get_announcements_for_symbol: Waiting for table rows")
-            wait.until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "#CFanncEquityTable tbody tr")
-                )
-            )
-            logger.info(f"get_announcements_for_symbol: Table rows found")
-            
-            # Get HTML and parse immediately after rows appear
-            html = driver.page_source
+            # Parse HTML immediately after rows appear
             rows = _parse_announcements_table(html)
             logger.info(f"get_announcements_for_symbol: Parsed {len(rows)} rows from table")
             
             # Only scroll AFTER rows exist and only if needed to trigger lazy loading
-            # Limit to 1-2 iterations with condition check
+            # Limit to 1 iteration with condition check
             if rows and len(rows) > 0:
                 initial_count = len(rows)
                 # Try scrolling once to trigger lazy loading if needed
@@ -807,8 +1006,8 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
             return rows
             
         except TimeoutException as e:
-            # Fail cleanly on timeout - return empty list or raise controlled error
-            error_msg = f"Timeout waiting for announcements table/rows: {str(e)}"
+            # Fail cleanly on timeout - save debug artifacts and raise
+            error_msg = f"Timeout waiting for announcements table rows: {str(e)}"
             logger.error(f"get_announcements_for_symbol: {error_msg}")
             # Try to get page source anyway in case table exists but wait failed
             try:
@@ -819,16 +1018,28 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
                     return rows
             except Exception:
                 pass
-            # If no rows found, raise timeout exception
+            # If no rows found, raise timeout exception (debug artifacts already saved by wait_for_table_rows)
             raise TimeoutException(error_msg) from e
             
     except (WebDriverException, TimeoutException) as e:
         # Catch WebDriverException to prevent multiple Selenium calls after fatal browser error
         logger.error(f"get_announcements_for_symbol: Selenium error: {str(e)}")
+        # Save debug artifacts on any error
+        if driver:
+            try:
+                _save_debug_artifacts(driver, prefix="selenium_error")
+            except Exception:
+                pass
         raise
     except Exception as e:
         # Catch any other exceptions
         logger.error(f"get_announcements_for_symbol: Unexpected error: {str(e)}")
+        # Save debug artifacts on any error
+        if driver:
+            try:
+                _save_debug_artifacts(driver, prefix="unexpected_error")
+            except Exception:
+                pass
         raise
     finally:
         # Always ensure driver is closed, even on timeout or parsing errors
