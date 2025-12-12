@@ -665,7 +665,6 @@ def _parse_announcements_table(html: str) -> List[Dict]:
 def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dict]:
     """
     Fetch announcements for the given symbol. Uses Selenium since API may not be available.
-    Returns only the first 100 rows.
     """
     symbol = symbol.upper().strip()
 
@@ -676,8 +675,7 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         api_rows = _fetch_announcements_api(symbol)
         # Only return API results if we actually got data
         if api_rows and len(api_rows) > 0:
-            # Limit to first 100 rows
-            return api_rows[:100]
+            return api_rows
     except Exception:
         # API failed, continue to Selenium
         pass
@@ -723,7 +721,6 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
             html = driver.page_source
             rows = _parse_announcements_table(html)
         
-        # Limit to first 100 rows
-        return rows[:100]
+        return rows
     finally:
         driver.quit()
