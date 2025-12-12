@@ -216,26 +216,37 @@ return window.__pendingRequests;
 
 
 def _count_table_rows_js(selector):
-    # JS returns an object {count: N, found: boolean}
+    # JS returns an object {count: N, found: boolean, hasTable: boolean, hasTbody: boolean}
     return f"""
     (function(sel){{
       var els = document.querySelectorAll(sel);
-      if (!els || els.length === 0) return {{count:0, found:false}};
+      if (!els || els.length === 0) return {{count:0, found:false, hasTable:false, hasTbody:false}};
       for (var i=0;i<els.length;i++){{
         var el = els[i];
         var tag = (el.tagName || '').toLowerCase();
         if (tag === 'table') {{
-          var rows = el.querySelectorAll('tbody tr').length || el.querySelectorAll('tr').length;
-          return {{count: rows, found: rows>0}};
+          var tbody = el.querySelector('tbody');
+          var tbodyRows = tbody ? tbody.querySelectorAll('tr').length : 0;
+          var allRows = el.querySelectorAll('tr').length;
+          // Count only tbody rows, not header rows
+          var rowCount = tbodyRows > 0 ? tbodyRows : (allRows > 0 ? allRows - 1 : 0);
+          return {{
+            count: rowCount, 
+            found: rowCount > 0, 
+            hasTable: true, 
+            hasTbody: !!tbody,
+            tbodyRowCount: tbodyRows,
+            allRowCount: allRows
+          }};
         }} else if (tag === 'tr') {{
           // selector already targets rows
-          return {{count: els.length, found: els.length>0}};
+          return {{count: els.length, found: els.length>0, hasTable:false, hasTbody:false}};
         }} else {{
           var rows2 = el.querySelectorAll('tr').length;
-          if (rows2 > 0) return {{count: rows2, found:true}};
+          if (rows2 > 0) return {{count: rows2, found:true, hasTable:false, hasTbody:false}};
         }}
       }}
-      return {{count:0, found:false}};
+      return {{count:0, found:false, hasTable:false, hasTbody:false}};
     }})(arguments[0]);
     """
 
@@ -285,15 +296,30 @@ def wait_for_table_rows(driver: WebDriver, table_selector: str, timeout: int = 6
             if isinstance(result, dict):
                 count = int(result.get("count", 0))
                 found = bool(result.get("found", False))
+                has_table = bool(result.get("hasTable", False))
+                has_tbody = bool(result.get("hasTbody", False))
+                tbody_row_count = int(result.get("tbodyRowCount", 0))
+                all_row_count = int(result.get("allRowCount", 0))
+                
+                # Log diagnostic info periodically
+                if int(time.time()) % 10 == 0:  # Log every 10 seconds
+                    logger.info(f"wait_for_table_rows: hasTable={has_table}, hasTbody={has_tbody}, tbodyRows={tbody_row_count}, allRows={all_row_count}, count={count}")
             else:
                 # fallback if driver returns something strange
                 count = int(result if isinstance(result, int) else 0)
                 found = count > 0
+                has_table = False
+                has_tbody = False
 
             if found and count > 0:
-                # table rendered
+                # table rendered with rows
                 logger.info(f"wait_for_table_rows: Found {count} rows in table")
                 return driver.page_source
+            
+            # If table exists but no rows, log it for debugging
+            if has_table and count == 0:
+                if int(time.time()) % 15 == 0:  # Log every 15 seconds
+                    logger.warning(f"wait_for_table_rows: Table exists but has {count} rows (tbodyRows={tbody_row_count if isinstance(result, dict) else 'N/A'})")
 
             # optional: check pending requests count (if we injected)
             pending = None
@@ -309,15 +335,24 @@ def wait_for_table_rows(driver: WebDriver, table_selector: str, timeout: int = 6
             except Exception:
                 pending = None
 
-            # if no rows but no pending requests for >1.0s, break (page likely done)
-            if pending == 0 and last_pending_zero_time and (time.time() - last_pending_zero_time) > 1.0:
-                # final check to see if rows showed up in the short interval
+            # if no rows but no pending requests for >2.0s, check one more time then break
+            if pending == 0 and last_pending_zero_time and (time.time() - last_pending_zero_time) > 2.0:
+                # final check to see if rows showed up
                 result = driver.execute_script(_count_table_rows_js(table_selector), table_selector)
                 count = int(result.get("count", 0)) if isinstance(result, dict) else int(result if isinstance(result, int) else 0)
                 if count > 0:
                     logger.info(f"wait_for_table_rows: Found {count} rows after pending requests settled")
                     return driver.page_source
-                # else let loop continue until timeout in case something else loads
+                # If still no rows after requests settled, wait a bit more for potential delayed rendering
+                logger.warning(f"wait_for_table_rows: No rows found after requests settled, waiting 5 more seconds for delayed rendering")
+                time.sleep(5)
+                # Final check
+                result = driver.execute_script(_count_table_rows_js(table_selector), table_selector)
+                count = int(result.get("count", 0)) if isinstance(result, dict) else int(result if isinstance(result, int) else 0)
+                if count > 0:
+                    logger.info(f"wait_for_table_rows: Found {count} rows after additional wait")
+                    return driver.page_source
+                # If still no rows, continue waiting until timeout
             time.sleep(poll)
         except WebDriverException as wde:
             # sometimes chromedriver throws transient errors; allow a short pause and retry
@@ -772,6 +807,12 @@ def _parse_announcements_table(html: str) -> List[Dict]:
         # Try alternative table IDs or class names
         table = soup.find("table", class_=lambda x: x and "CFannc" in str(x))
         if not table:
+            # Check if page might be blocked or showing different content
+            if "blocked" in html.lower() or "access denied" in html.lower() or "forbidden" in html.lower():
+                logger.warning("_parse_announcements_table: Page appears to be blocked or access denied")
+            # Check if page loaded but table doesn't exist
+            if "<table" in html.lower() and "CFanncEquityTable" not in html:
+                logger.warning("_parse_announcements_table: Page has tables but not CFanncEquityTable - may be wrong page")
             return []
 
     rows: List[Dict] = []
@@ -975,13 +1016,33 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
         
         # Use longer timeout in production (Railway) - check environment or use default
         # Production may be slower, so give it more time
-        wait_timeout = int(os.environ.get("ANNOUNCEMENTS_WAIT_TIMEOUT", "120"))  # Default 120s, configurable
+        wait_timeout = int(os.environ.get("ANNOUNCEMENTS_WAIT_TIMEOUT", "150"))  # Increased to 150s default
         
+        # First, wait for table to exist
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.ID, "CFanncEquityTable"))
+            )
+            logger.info(f"get_announcements_for_symbol: Table element found")
+        except TimeoutException:
+            logger.error(f"get_announcements_for_symbol: Table element not found after 30s")
+            raise
+        
+        # Then wait for tbody to exist (table structure is ready)
+        try:
+            WebDriverWait(driver, 30).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "#CFanncEquityTable tbody"))
+            )
+            logger.info(f"get_announcements_for_symbol: Table tbody found")
+        except TimeoutException:
+            logger.warning(f"get_announcements_for_symbol: Table tbody not found, but continuing to wait for rows")
+        
+        # Now wait for actual rows using robust waiter
         try:
             html = wait_for_table_rows(
                 driver, 
                 table_selector, 
-                timeout=wait_timeout,  # Longer timeout for slow announcements table (120s default)
+                timeout=wait_timeout,  # Longer timeout for slow announcements table (150s default)
                 poll=0.5, 
                 use_pending_requests=True
             )
@@ -1020,12 +1081,50 @@ def get_announcements_for_symbol(symbol: str, headless: bool = True) -> List[Dic
             # This handles cases where table loads slowly but eventually appears
             try:
                 html = driver.page_source
+                
+                # Check if page loaded correctly - look for common indicators
+                page_indicators = {
+                    "has_table_id": "#CFanncEquityTable" in html or "CFanncEquityTable" in html,
+                    "has_table_tag": "<table" in html.lower(),
+                    "has_tbody": "<tbody" in html.lower(),
+                    "html_length": len(html),
+                    "page_title": ""
+                }
+                try:
+                    page_indicators["page_title"] = driver.title
+                except:
+                    pass
+                
+                logger.info(f"get_announcements_for_symbol: Page indicators after timeout: {page_indicators}")
+                
+                # Check if table exists in DOM and count rows directly
+                try:
+                    table_elem = driver.find_element(By.ID, "CFanncEquityTable")
+                    try:
+                        tbody_elem = table_elem.find_element(By.TAG_NAME, "tbody")
+                        tr_elements = tbody_elem.find_elements(By.TAG_NAME, "tr")
+                        logger.info(f"get_announcements_for_symbol: Table exists in DOM with {len(tr_elements)} <tr> elements in tbody")
+                        if len(tr_elements) > 0:
+                            # Rows exist in DOM, try parsing again
+                            time.sleep(1)  # Brief wait
+                            html = driver.page_source
+                            rows = _parse_announcements_table(html)
+                            if rows and len(rows) > 0:
+                                logger.warning(f"get_announcements_for_symbol: Found {len(rows)} rows on retry parsing (DOM had {len(tr_elements)} elements)")
+                                return rows
+                    except Exception:
+                        # No tbody or no rows in tbody
+                        logger.warning(f"get_announcements_for_symbol: Table exists but tbody/rows not found in DOM")
+                except Exception as dom_check:
+                    logger.error(f"get_announcements_for_symbol: Table not found in DOM: {str(dom_check)}")
+                
+                # Try parsing HTML anyway
                 rows = _parse_announcements_table(html)
                 if rows and len(rows) > 0:
                     logger.warning(f"get_announcements_for_symbol: Found {len(rows)} rows despite timeout, returning them (this is OK)")
                     return rows
                 else:
-                    logger.error(f"get_announcements_for_symbol: No rows found in page source after timeout")
+                    logger.error(f"get_announcements_for_symbol: No rows found in page source after timeout. Page may be blocked or table not loaded.")
             except Exception as parse_error:
                 logger.error(f"get_announcements_for_symbol: Error parsing page source after timeout: {str(parse_error)}")
             
